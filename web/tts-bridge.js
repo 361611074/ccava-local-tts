@@ -7,10 +7,18 @@
  *
  * 不依赖任何框架。原生音色照旧走浏览器，只有虚拟音色走本地服务。
  *
- * v4 针对卡顿的三处改动：
- *   1. 首段切短（80 字），后面才用 280 字 —— 点下朗读能更快出声
- *   2. 播当前段的同时预取下一段（存成 blob），段与段之间不再等合成
- *   3. 音色列表重试次数加长，服务刚开机预热慢时也能等到
+ * v5 解决「一段一段、不连贯」：
+ *
+ *   实测每段合成音频自带 段首 188ms + 段尾 538ms 静音（非常稳定）。
+ *   两段首尾相接，每个接缝就有 726 毫秒没声音——七段就是 4.4 秒空白，
+ *   听感正好是「一句一停」。之前 v4 的预取只消掉了「等合成」，
+ *   没消掉音频内部的静音，所以数据漂亮、耳朵还是觉得断。
+ *
+ *   1. 解码成 PCM 后裁静音：段首留 20ms、段尾留 160ms，句末自然停顿还在，
+ *      多余的死气去掉，每个接缝从 726ms 降到约 180ms
+ *   2. 用 AudioContext 精确排期（BufferSource.start(when)），
+ *      不再是「一段播完再播下一段」，而是采样级首尾相接，没有元素切换的缝
+ *   3. 单请求串行预解码（不并发抢合成资源），提前 3 段备好
  */
 (function () {
     'use strict';
@@ -44,10 +52,25 @@
         'zh-TW-YunJheNeural': '雲哲 · 男 · 台湾'
     };
 
-    // 首段短、后续长：首段 80 字合成约 0.5 秒就能出声，
-    // 后面每段 280 字，配合预取，段与段之间听不出停顿。
+    // 首段短，点下朗读能快速出声；后面段拉长，减少接缝数量。
+    // 合成耗时由固定开销主导（80 字约 1.6 秒，260 字约 2.9 秒），
+    // 所以首段短是「快出声」的关键，后续长是「少接缝」的关键。
     var FIRST_CHUNK = 80;
-    var MAX_CHUNK = 280;
+    var MAX_CHUNK = 300;
+
+    // 裁静音参数。实测段首 188ms、段尾 538ms，这里保留句末该有的自然停顿，
+    // 只砍掉多余的。留太少会削掉辅音起音，听着发硬。
+    var TRIM_THRESHOLD = 0.004;   // 约 -48 dBFS，低于这个算静音
+    var HEAD_KEEP = 0.02;         // 段首保留 20ms
+    var TAIL_KEEP = 0.16;         // 段尾保留 160ms
+
+    // 提前备好几段（解码后的 PCM）。合成一段要 1.6~3 秒，而一段音频能放
+    // 60~90 秒，所以 2 段足够覆盖任何抖动。别开太大——解码后的 PCM 按
+    // 48kHz float32 算约 11.5MB/分钟，留太多会吃掉几百兆内存。
+    var AHEAD = 2;
+
+    // 首段排期留一点余量，避免 start 时时间点已经过期
+    var START_LEAD = 0.06;
 
     // 开机后服务可能还在预热，页面就打开了。失败时多试几次，别一次失败就放弃。
     var RETRY_DELAYS = [0, 1000, 2000, 3000, 5000, 8000, 12000, 15000, 20000];
@@ -61,17 +84,30 @@
     var virtualVoices = [];
 
     var state = {
-        audio: null,
+        audio: null,      // 退路模式（没有 Web Audio）用的 <audio>
         queue: [],
-        index: 0,
+        urls: [],
         utter: null,
         cancelled: false,
         paused: false,
         seq: 0
     };
 
-    // 预取缓存：index -> { blobUrl, done, failed }
-    var prefetched = {};
+    // 解码后的段：index -> AudioBuffer（已裁静音）或 null（全静音 / 合成失败）
+    var decoded = {};
+    var prefetching = false;
+    var prefetchNext = 0;
+
+    // 播放调度状态
+    var play = {
+        ctx: null,
+        next: 0,        // 下一段要排的索引
+        cursor: 0,      // 下一个可排的时间点（AudioContext 时间轴）
+        sources: [],
+        scheduled: 0,
+        played: 0,
+        running: false
+    };
 
     function toEdgeRate(rate) {
         var r = typeof rate === 'number' && isFinite(rate) ? rate : 1;
@@ -278,6 +314,240 @@
             + '&volume=' + encodeURIComponent(toEdgeVolume(utter && utter.volume));
     }
 
+    // ------------------------------------------------------------ Web Audio
+
+    function getCtx() {
+        if (play.ctx) {
+            if (play.ctx.state === 'suspended' && !state.paused) {
+                try { play.ctx.resume(); } catch (e) {}
+            }
+            return play.ctx;
+        }
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return null;
+        try {
+            play.ctx = new AC();
+        } catch (e) {
+            return null;
+        }
+        return play.ctx;
+    }
+
+    // 浏览器的自动播放策略：AudioContext 如果在用户手势之外创建会被挂起，
+    // 表现是「点了朗读但没声音」。页面自动续读下一章时就可能踩到这个。
+    // 这里在任何一次交互上补一次 resume，成本为零。
+    (function armResume() {
+        function onGesture() {
+            if (play.ctx && play.ctx.state === 'suspended' && !state.paused) {
+                try { play.ctx.resume(); } catch (e) {}
+            }
+        }
+        var evs = ['pointerdown', 'mousedown', 'keydown', 'touchstart'];
+        for (var i = 0; i < evs.length; i++) {
+            try {
+                document.addEventListener(evs[i], onGesture, true);
+            } catch (e) {}
+        }
+    })();
+
+    function sliceBuffer(ctx, buf, from, to) {
+        var len = to - from;
+        var out = ctx.createBuffer(buf.numberOfChannels, len, buf.sampleRate);
+        for (var c = 0; c < buf.numberOfChannels; c++) {
+            out.getChannelData(c).set(buf.getChannelData(c).subarray(from, to));
+        }
+        return out;
+    }
+
+    // 裁掉段首段尾多余的静音。
+    // 这是「不连贯」的真正原因：每段自带 188ms 段首 + 538ms 段尾，
+    // 首尾相接就是 726ms 没声音，七段下来 4.4 秒空白。
+    function trimBuffer(ctx, buf) {
+        var n = buf.length;
+        var chs = [];
+        for (var c = 0; c < buf.numberOfChannels; c++) {
+            chs.push(buf.getChannelData(c));
+        }
+
+        function loud(i) {
+            for (var c = 0; c < chs.length; c++) {
+                if (Math.abs(chs[c][i]) > TRIM_THRESHOLD) return true;
+            }
+            return false;
+        }
+
+        var head = 0;
+        while (head < n && !loud(head)) head++;
+        if (head >= n) return null;          // 整段静音，直接丢掉
+
+        var tail = n - 1;
+        while (tail > head && !loud(tail)) tail--;
+
+        var sr = buf.sampleRate;
+        var from = Math.max(0, head - Math.round(sr * HEAD_KEEP));
+        var to = Math.min(n, tail + 1 + Math.round(sr * TAIL_KEEP));
+        if (to - from < sr * 0.05) return null;
+
+        return sliceBuffer(ctx, buf, from, to);
+    }
+
+    function ensureDecoded(idx) {
+        if (decoded[idx] !== undefined) {
+            return Promise.resolve(decoded[idx]);
+        }
+        var ctx = getCtx();
+        if (!ctx || !state.urls[idx]) {
+            return Promise.resolve(null);
+        }
+
+        return fetch(state.urls[idx], { cache: 'no-store' })
+            .then(function (r) {
+                if (!r.ok) throw new Error('http ' + r.status);
+                return r.arrayBuffer();
+            })
+            .then(function (ab) {
+                // decodeAudioData 会「接管」传进去的 ArrayBuffer，传副本更稳
+                return ctx.decodeAudioData(ab.slice(0));
+            })
+            .then(function (buf) {
+                var t = trimBuffer(ctx, buf);
+                decoded[idx] = t;
+                return t;
+            })
+            .catch(function () {
+                decoded[idx] = null;
+                return null;
+            });
+    }
+
+    // 串行预解码：同一时刻只有一个合成请求在跑。
+    // 并发会互相抢资源（实测每段从 1.6s 拖到 2.8s），而串行完全跟得上播放。
+    function pumpPrefetch() {
+        if (state.cancelled || prefetching || !state.utter) return;
+        var i = prefetchNext;
+        if (i >= state.queue.length) return;
+        if (i > play.next + AHEAD) return;    // 别跑太远，白占内存
+
+        prefetching = true;
+        ensureDecoded(i).then(function () {
+            prefetching = false;
+            if (prefetchNext <= i) prefetchNext = i + 1;
+            pumpPrefetch();
+        });
+    }
+
+    function pumpPlay() {
+        var ctx = getCtx();
+        if (!ctx || state.cancelled || !state.utter || play.running) return;
+        play.running = true;
+
+        // 游标落到过去（首段，或者中间被卡了一下）就重新对齐到现在
+        if (play.cursor < ctx.currentTime) {
+            play.cursor = ctx.currentTime + START_LEAD;
+        }
+
+        (function step() {
+            if (state.cancelled || !state.utter) {
+                play.running = false;
+                return;
+            }
+            if (play.next >= state.queue.length) {
+                play.running = false;
+                maybeEnd();
+                return;
+            }
+            // 已经排出去的段够听了，等播完再补，别一次把整章都塞进音频图
+            if (play.scheduled - play.played >= AHEAD) {
+                play.running = false;
+                return;
+            }
+
+            var idx = play.next;
+            ensureDecoded(idx).then(function (buf) {
+                if (state.cancelled || !state.utter) {
+                    play.running = false;
+                    return;
+                }
+                if (!buf) {                  // 全静音或合成失败：跳过，别卡住
+                    play.next++;
+                    step();
+                    return;
+                }
+
+                var when = Math.max(play.cursor, ctx.currentTime + 0.02);
+                var src = ctx.createBufferSource();
+                src.buffer = buf;
+                src.connect(ctx.destination);
+
+                try {
+                    src.start(when);
+                } catch (e) {
+                    play.next++;
+                    step();
+                    return;
+                }
+
+                play.cursor = when + buf.duration;
+                play.next++;
+                play.scheduled++;
+                play.sources.push(src);
+
+                src.onended = function () {
+                    play.played++;
+                    try { src.disconnect(); } catch (e) {}
+                    // 播完就释放这段 PCM。不释放的话长章节会一直攒，
+                    // 48kHz float32 约 11.5MB/分钟，一小时能吃掉 700MB。
+                    try { delete decoded[idx]; } catch (e) {}
+                    for (var k = 0; k < play.sources.length; k++) {
+                        if (play.sources[k] === src) { play.sources.splice(k, 1); break; }
+                    }
+                    pumpPlay();              // 播完一段补排下一段
+                    maybeEnd();
+                };
+
+                pumpPrefetch();
+                step();
+            });
+        })();
+    }
+
+    function maybeEnd() {
+        if (state.cancelled || !state.utter) return;
+        if (play.next < state.queue.length) return;
+        if (play.played < play.scheduled) return;
+        finish();
+    }
+
+    function finish() {
+        var u = state.utter;
+        state.utter = null;
+        state.queue = [];
+        state.urls = [];
+        cleanup();
+        fire(u, 'onend');
+    }
+
+    function cleanup() {
+        for (var i = 0; i < play.sources.length; i++) {
+            var s = play.sources[i];
+            try { s.onended = null; } catch (e) {}
+            try { s.stop(); } catch (e) {}
+            try { s.disconnect(); } catch (e) {}
+        }
+        play.sources = [];
+        play.next = 0;
+        play.cursor = 0;
+        play.scheduled = 0;
+        play.played = 0;
+        play.running = false;
+        decoded = {};
+        prefetching = false;
+        prefetchNext = 0;
+        stopAudio();
+    }
+
+    // ------------------------------------------------------------ 退路模式
+
     function stopAudio() {
         var a = state.audio;
         state.audio = null;
@@ -291,95 +561,40 @@
         } catch (e) {}
     }
 
-    function releasePrefetch() {
-        for (var k in prefetched) {
-            if (Object.prototype.hasOwnProperty.call(prefetched, k)) {
-                var it = prefetched[k];
-                if (it && it.blobUrl) {
-                    try { URL.revokeObjectURL(it.blobUrl); } catch (e) {}
-                }
+    // 没有 Web Audio 时退回逐段 <audio>。接缝会比较明显（每段自带 700ms 静音），
+    // 但至少能听，不至于整页不能朗读。
+    function legacySpeak(utter) {
+        var queue = splitText(utter.text);
+        var i = 0;
+
+        state.cancelled = false;
+        state.paused = false;
+        state.utter = utter;
+        fire(utter, 'onstart');
+
+        function next() {
+            if (state.cancelled || i >= queue.length) {
+                var u = state.utter;
+                state.utter = null;
+                stopAudio();
+                if (!state.cancelled && u) fire(u, 'onend');
+                return;
+            }
+            var a = new Audio(buildUrl(queue[i++], utter));
+            a.preload = 'auto';
+            state.audio = a;
+            a.onended = next;
+            a.onerror = next;
+            var p = a.play();
+            if (p && typeof p.catch === 'function') {
+                p.catch(next);
             }
         }
-        prefetched = {};
+
+        next();
     }
 
-    // 提前把第 idx 段合成好、下载成 blob，播放时就不用等
-    function prefetchAt(idx) {
-        if (idx >= state.queue.length || prefetched[idx]) return;
-        var item = { blobUrl: null, done: false };
-        prefetched[idx] = item;
-        var url = buildUrl(state.queue[idx], state.utter);
-        fetch(url, { cache: 'no-store' })
-            .then(function (r) {
-                if (!r.ok) throw new Error('http ' + r.status);
-                return r.blob();
-            })
-            .then(function (b) {
-                item.blobUrl = URL.createObjectURL(b);
-                item.done = true;
-            })
-            .catch(function () {
-                item.done = true;
-                item.failed = true;
-            });
-    }
-
-    function playNext() {
-        if (state.cancelled || state.index >= state.queue.length) {
-            var u = state.utter;
-            state.utter = null;
-            stopAudio();
-            releasePrefetch();
-            if (!state.cancelled) {
-                fire(u, 'onend');
-            }
-            return;
-        }
-
-        // 上一段必须先彻底停掉，否则出错时两段音频会叠在一起响
-        stopAudio();
-
-        var utter = state.utter;
-        var idx = state.index++;
-        var text = state.queue[idx];
-        var seq = ++state.seq;
-
-        // 预取好了就用 blob，省掉一次网络往返和解码前的等待
-        var item = prefetched[idx];
-        var useBlob = !!(item && item.blobUrl);
-        var url = useBlob ? item.blobUrl : buildUrl(text, utter);
-
-        var audio = new Audio(url);
-        audio.preload = 'auto';
-        state.audio = audio;
-
-        // 序号对不上说明这条回调来自上一段，直接丢弃，避免重复推进队列
-        function advance() {
-            if (state.cancelled || state.seq !== seq) return;
-            if (useBlob && item && item.blobUrl) {
-                try { URL.revokeObjectURL(item.blobUrl); } catch (e) {}
-                item.blobUrl = null;
-            }
-            playNext();
-        }
-
-        audio.onended = advance;
-        audio.onerror = advance;
-
-        var p = audio.play();
-        if (p && typeof p.catch === 'function') {
-            p.catch(advance);
-        }
-
-        // 预取下一段要等一会儿再发。立刻发会和当前段抢合成资源
-        // （实测并发时每段都从 1.6s 拖到 2.8s，首段要多等 2 秒才出声）。
-        // 800ms 足够当前段把请求送出去，而下一段离播放还有十几秒，完全来得及。
-        var nextIdx = state.index;
-        setTimeout(function () {
-            if (state.cancelled || state.seq !== seq) return;
-            prefetchAt(nextIdx);
-        }, 800);
-    }
+    // ------------------------------------------------------------ 对外接口
 
     synth.getVoices = function () {
         var native = nativeGetVoices() || [];
@@ -397,40 +612,62 @@
         }
 
         synth.cancel();
+
+        if (!getCtx()) {
+            return legacySpeak(utter);
+        }
+
         state.cancelled = false;
         state.paused = false;
         state.queue = splitText(utter.text);
-        state.index = 0;
+        state.urls = state.queue.map(function (t) { return buildUrl(t, utter); });
         state.utter = utter;
+        state.seq++;
+
+        play.next = 0;
+        play.cursor = 0;
+        play.scheduled = 0;
+        play.played = 0;
+        play.sources = [];
+        play.running = false;
+        decoded = {};
+        prefetching = false;
+        prefetchNext = 0;
 
         fire(utter, 'onstart');
-        playNext();
+        pumpPrefetch();
+        pumpPlay();
     };
 
     synth.cancel = function () {
         state.cancelled = true;
         state.paused = false;
         state.queue = [];
-        state.index = 0;
+        state.urls = [];
         state.utter = null;
         state.seq++;
-        stopAudio();
-        releasePrefetch();
+        cleanup();
         try { nativeCancel(); } catch (e) {}
     };
 
     synth.pause = function () {
+        state.paused = true;
+        if (play.ctx && play.ctx.state === 'running') {
+            try { play.ctx.suspend(); } catch (e) {}
+        }
         if (state.audio) {
             try { state.audio.pause(); } catch (e) {}
-            state.paused = true;
         }
         try { nativePause(); } catch (e) {}
     };
 
     synth.resume = function () {
+        state.paused = false;
+        if (play.ctx && play.ctx.state === 'suspended') {
+            try { play.ctx.resume(); } catch (e) {}
+        }
         if (state.audio) {
             try { state.audio.play(); } catch (e) {}
-            state.paused = false;
         }
         try { nativeResume(); } catch (e) {}
     };
