@@ -46,7 +46,7 @@ DEFAULT_CONFIG = {
     'port': PORT,
 }
 
-_voice_cache = {'ts': 0.0, 'data': None}
+_voice_cache = {'ts': 0.0, 'data': None, 'fetching': False}
 _cache_lock = threading.Lock()
 
 # 前端会预取后面几段，同一时刻可能有几个合成在跑。开太多会被微软限流，
@@ -126,29 +126,44 @@ async def _edge_voices():
     return out
 
 
-def edge_voices():
-    now = time.time()
-    if _voice_cache['data'] is not None and now - _voice_cache['ts'] < VOICE_CACHE_TTL:
+def edge_voices(wait=0.0):
+    """拿中文音色列表。
+
+    锁只用来保护状态，绝不把网络请求关在锁里——否则预热线程一开始拉，
+    所有 /voices 请求都得排队，页面看起来就是卡死（曾经等 25 秒）。
+    现在谁抢到 fetching 标志谁去拉，别人最多等 wait 秒，等不到就先返回旧数据，
+    前端有重试，很快会再来一次。
+    """
+    if _voice_cache['data'] is not None and time.time() - _voice_cache['ts'] < VOICE_CACHE_TTL:
         return _voice_cache['data']
-    # 启动预热线程可能正持着锁。这里必须等，不能立刻返回 None——
-    # 否则页面刚打开时 /voices 会返回空列表，前端以为没有在线音色。
-    if not _cache_lock.acquire(timeout=25):
-        return _voice_cache['data']
-    try:
-        # 等锁期间别的线程可能已经拉好了，直接用，别重复请求微软
-        if (_voice_cache['data'] is not None
-                and time.time() - _voice_cache['ts'] < VOICE_CACHE_TTL):
+
+    deadline = time.time() + wait
+    while True:
+        with _cache_lock:
+            # 等锁期间别人可能已经拉好了，直接用，别重复请求微软
+            if (_voice_cache['data'] is not None
+                    and time.time() - _voice_cache['ts'] < VOICE_CACHE_TTL):
+                return _voice_cache['data']
+            if not _voice_cache['fetching']:
+                _voice_cache['fetching'] = True
+                break
+        if time.time() >= deadline:
             return _voice_cache['data']
+        time.sleep(0.1)
+
+    try:
         data = asyncio.run(asyncio.wait_for(_edge_voices(), timeout=20))
-        _voice_cache['data'] = data
-        _voice_cache['ts'] = time.time()
+        with _cache_lock:
+            _voice_cache['data'] = data
+            _voice_cache['ts'] = time.time()
         log('edge voices: %d' % len(data))
         return data
     except Exception as exc:
         log('edge voices failed: %s' % exc)
         return _voice_cache['data']
     finally:
-        _cache_lock.release()
+        with _cache_lock:
+            _voice_cache['fetching'] = False
 
 
 # ---------------------------------------------------------------- HTTP
@@ -261,7 +276,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if path == '/voices':
-                edge = edge_voices() or []
+                # 页面刚打开时预热可能还在跑，给它 6 秒等一等，
+                # 通常 1~2 秒就拿到真列表；真拉不到就返回空，前端会重试。
+                edge = edge_voices(wait=6) or []
                 self._json({'ok': True, 'voices': list(edge),
                             'engines': {'edge': len(edge)}})
                 return
