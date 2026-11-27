@@ -42,8 +42,18 @@
     // 单段字数。太长会等很久才出声，太短会让请求数暴增，280 是个平衡点。
     var MAX_CHUNK = 280;
 
-    // 开机后服务可能还在预热，页面就打开了。失败时多试几次，别一次失败就放弃。
-    var RETRY_DELAYS = [0, 1200, 2500, 4000, 6000];
+    // 首段单独切短：第一句说完就出声，别让用户干等一秒多。
+    var FIRST_CHUNK = 80;
+
+    // 提前合成后面几块。这样一块播完时下一块已经在内存里，切换不用再等网络。
+    // 每块大约一分钟音频，提前 2 块足够覆盖任何抖动，也能在一块失败时留个备胎。
+    var PREFETCH = 2;
+
+    // 开机自启时服务要预热（拉一次微软音色列表），页面可能比服务先打开。
+    // 前几次密一点，之后就低频补，别让用户非得手动刷新页面才能看到在线音色。
+    var RETRY_DELAYS = [0, 800, 1500, 2500, 4000, 6000, 8000, 10000, 12000];
+    var RETRY_TAIL = 5000;      // 表走完后每隔多久再试
+    var RETRY_MAX = 48;         // 兜底上限，约 4 分钟，避免服务没装时无限重试
 
     var nativeGetVoices = synth.getVoices.bind(synth);
     var nativeSpeak = synth.speak.bind(synth);
@@ -60,7 +70,14 @@
         utter: null,
         cancelled: false,
         paused: false,
-        seq: 0
+        // session 管一次朗读的全程，cancel 或重新 speak 时递增；
+        // seq 管单块，用来丢掉过期的播放回调。两者不能混用——
+        // 预取是跨块的，如果拿 seq 校验，下一块一开始预取结果就全废了。
+        session: 0,
+        seq: 0,
+        cache: {},      // 块序号 -> Promise<blob URL>
+        ctrls: {},      // 块序号 -> AbortController
+        urls: []        // 所有 createObjectURL 的结果，统一回收
     };
 
     function toEdgeRate(rate) {
@@ -174,20 +191,36 @@
         }
     } catch (e) {}
 
+    var SENTENCE_END = /[。！？；：…\n]/;
+
     function splitText(text) {
+        var s = String(text);
         var out = [];
+
+        // 首块只取到第一句结束，通常 20~60 字。合成一次不到一秒就能出声，
+        // 用户点下去马上有反应，不用盯着屏幕等。
+        if (s.length > FIRST_CHUNK) {
+            for (var k = 0; k < FIRST_CHUNK; k++) {
+                if (SENTENCE_END.test(s.charAt(k))) {
+                    out.push(s.slice(0, k + 1));
+                    s = s.slice(k + 1);
+                    break;
+                }
+            }
+        }
+
         var buf = '';
-        var parts = String(text).split(/(?<=[。！？；：…\n])/);
+        var parts = s.split(/(?<=[。！？；：…\n])/);
 
         for (var i = 0; i < parts.length; i++) {
-            var s = parts[i];
-            if (!s) continue;
+            var piece = parts[i];
+            if (!piece) continue;
 
-            if (buf && buf.length + s.length > MAX_CHUNK) {
+            if (buf && buf.length + piece.length > MAX_CHUNK) {
                 out.push(buf);
-                buf = s;
+                buf = piece;
             } else {
-                buf += s;
+                buf += piece;
             }
 
             while (buf.length > MAX_CHUNK) {
@@ -210,10 +243,32 @@
         }
     }
 
+    function ttsUrl(utter, text) {
+        var voiceName = (utter && utter.__ttsEdge)
+            || edgeNameOf(utter && utter.voice)
+            || 'zh-CN-XiaoxiaoNeural';
+
+        return API + '/tts'
+            + '?text=' + encodeURIComponent(text)
+            + '&voice=' + encodeURIComponent(voiceName)
+            + '&rate=' + encodeURIComponent(toEdgeRate(utter && utter.rate))
+            + '&pitch=' + encodeURIComponent(toEdgePitch(utter && utter.pitch))
+            + '&volume=' + encodeURIComponent(toEdgeVolume(utter && utter.volume));
+    }
+
+    function revokeOne(url) {
+        if (typeof url !== 'string' || url.indexOf('blob:') !== 0) return;
+        try { URL.revokeObjectURL(url); } catch (e) {}
+        var i = state.urls.indexOf(url);
+        if (i >= 0) state.urls.splice(i, 1);
+    }
+
     function stopAudio() {
         var a = state.audio;
         state.audio = null;
         if (!a) return;
+        var src = '';
+        try { src = a.src || ''; } catch (e) {}
         try {
             a.onended = null;
             a.onerror = null;
@@ -221,6 +276,64 @@
             a.removeAttribute('src');
             a.load();
         } catch (e) {}
+        // 播完或被打断的音频要立刻把 Blob 释放掉，不然长章节会一直攒内存
+        revokeOne(src);
+    }
+
+    // 一次朗读结束或被取消时，把没来得及播的预取全部清干净
+    function resetPipeline() {
+        for (var k in state.ctrls) {
+            try { state.ctrls[k].abort(); } catch (e) {}
+        }
+        state.ctrls = {};
+        state.cache = {};
+
+        for (var i = 0; i < state.urls.length; i++) {
+            try { URL.revokeObjectURL(state.urls[i]); } catch (e) {}
+        }
+        state.urls = [];
+    }
+
+    function fetchChunk(session, idx, text, utter) {
+        if (state.cache[idx]) return state.cache[idx];
+
+        var ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
+        if (ctrl) state.ctrls[idx] = ctrl;
+
+        var p = fetch(ttsUrl(utter, text), {
+            cache: 'no-store',
+            signal: ctrl ? ctrl.signal : undefined
+        }).then(function (r) {
+            if (!r.ok) throw new Error('tts http ' + r.status);
+            return r.blob();
+        }).then(function (blob) {
+            // 会话已经换了（用户点了别的段落），这份音频作废
+            if (state.session !== session) return null;
+            var url = URL.createObjectURL(blob);
+            state.urls.push(url);
+            return url;
+        });
+
+        // 失败别把坏 Promise 钉死在缓存里，下一轮还能重试
+        p.catch(function () {
+            if (state.cache[idx] === p) delete state.cache[idx];
+            delete state.ctrls[idx];
+        });
+
+        state.cache[idx] = p;
+        return p;
+    }
+
+    // 把后面几块一次性排进合成队列。这是解决「读一会卡一下」的关键：
+    // 卡顿的根因是「上一块播完才开始请求下一块」，中间空等一次完整合成时间。
+    function prefetchAhead(session) {
+        if (!state.utter) return;
+        for (var k = 0; k < PREFETCH; k++) {
+            var i = state.index + k;
+            if (i >= state.queue.length) break;
+            if (state.cache[i]) continue;
+            fetchChunk(session, i, state.queue[i], state.utter);
+        }
     }
 
     function playNext() {
@@ -228,6 +341,7 @@
             var u = state.utter;
             state.utter = null;
             stopAudio();
+            resetPipeline();
             if (!state.cancelled) {
                 fire(u, 'onend');
             }
@@ -237,34 +351,48 @@
         // 上一段必须先彻底停掉，否则出错时两段音频会叠在一起响
         stopAudio();
 
+        var session = state.session;
         var utter = state.utter;
-        var text = state.queue[state.index++];
+        var idx = state.index++;
+        var text = state.queue[idx];
         var seq = ++state.seq;
-        var voiceName = (utter && utter.__ttsEdge) || edgeNameOf(utter && utter.voice) || 'zh-CN-XiaoxiaoNeural';
 
-        var url = API + '/tts'
-            + '?text=' + encodeURIComponent(text)
-            + '&voice=' + encodeURIComponent(voiceName)
-            + '&rate=' + encodeURIComponent(toEdgeRate(utter && utter.rate))
-            + '&pitch=' + encodeURIComponent(toEdgePitch(utter && utter.pitch))
-            + '&volume=' + encodeURIComponent(toEdgeVolume(utter && utter.volume));
-
-        var audio = new Audio(url);
-        state.audio = audio;
-
-        // 序号对不上说明这条回调来自上一段，直接丢弃，避免重复推进队列
         function advance() {
             if (state.cancelled || state.seq !== seq) return;
             playNext();
         }
 
-        audio.onended = advance;
-        audio.onerror = advance;
-
-        var p = audio.play();
-        if (p && typeof p.catch === 'function') {
-            p.catch(advance);
+        function start(src) {
+            if (state.cancelled || state.seq !== seq || state.session !== session) return;
+            var audio = new Audio();
+            audio.src = src;
+            state.audio = audio;
+            audio.onended = advance;
+            audio.onerror = advance;
+            // 这一块已经就位，现在才去预取后面的。反过来的话首块会跟预取抢带宽，
+            // 用户反而要多等半秒才听到声音。每块有一分钟音频，晚一两秒预取完全来得及。
+            prefetchAhead(session);
+            // 合成期间用户按了暂停，就先挂上 src 等着，等 resume 再出声
+            if (state.paused) return;
+            var p = audio.play();
+            if (p && typeof p.catch === 'function') {
+                p.catch(advance);
+            }
         }
+
+        var ready = state.cache[idx] || fetchChunk(session, idx, text, utter);
+
+        ready.then(function (url) {
+            if (!url) return;
+            delete state.cache[idx];
+            delete state.ctrls[idx];
+            start(url);
+        }).catch(function () {
+            // 预取挂了就退回直连，让浏览器自己去拉，至少还能出声
+            if (state.session !== session) return;
+            delete state.cache[idx];
+            start(ttsUrl(utter, text));
+        });
     }
 
     synth.getVoices = function () {
@@ -296,11 +424,14 @@
     synth.cancel = function () {
         state.cancelled = true;
         state.paused = false;
+        state.session++;
+        state.seq++;
         state.queue = [];
         state.index = 0;
         state.utter = null;
-        state.seq++;
+        // 先停正在响的，再回收其余预取，顺序不能反
         stopAudio();
+        resetPipeline();
         try { nativeCancel(); } catch (e) {}
     };
 
@@ -313,9 +444,9 @@
     };
 
     synth.resume = function () {
+        state.paused = false;
         if (state.audio) {
             try { state.audio.play(); } catch (e) {}
-            state.paused = false;
         }
         try { nativeResume(); } catch (e) {}
     };
@@ -368,7 +499,8 @@
     function loadVoices(attempt) {
         var delay = RETRY_DELAYS[attempt];
         if (delay === undefined) {
-            return;
+            if (attempt > RETRY_MAX) return;
+            delay = RETRY_TAIL;
         }
         setTimeout(function () {
             fetch(API + '/voices', { cache: 'no-store' })

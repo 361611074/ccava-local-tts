@@ -48,6 +48,11 @@ DEFAULT_CONFIG = {
 
 _voice_cache = {'ts': 0.0, 'data': None}
 _cache_lock = threading.Lock()
+
+# 前端会预取后面几段，同一时刻可能有几个合成在跑。开太多会被微软限流，
+# 开太少预取就失去意义，4 个并发足够喂满播放又不会踩线。
+_synth_slots = threading.BoundedSemaphore(4)
+
 START_TS = time.time()
 
 
@@ -312,8 +317,10 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _synthesize(self, text, voice, rate, pitch, volume):
-        data = asyncio.run(asyncio.wait_for(
-            _edge_synth(text, voice, rate, pitch, volume), timeout=SYNTH_TIMEOUT))
+        # 超出并发上限就排队等，别让一堆线程同时怼 edge-tts 被限流
+        with _synth_slots:
+            data = asyncio.run(asyncio.wait_for(
+                _edge_synth(text, voice, rate, pitch, volume), timeout=SYNTH_TIMEOUT))
         if not data:
             raise RuntimeError('empty audio')
         return data
