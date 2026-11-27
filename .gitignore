@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# 打包产物（走 Release，不进仓库）
+dist/
+.build-tmp/
+package/
+*.zip
+*.exe
+
+# 运行时文件
+config.json
+server.log
+server.log.old
+test.mp3
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
