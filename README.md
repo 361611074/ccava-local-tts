@@ -82,7 +82,7 @@ Microsoft Yaoyao  - Chinese (Simplified, PRC)
 
 ### 方式一：下载安装包（推荐）
 
-1. 到 [Releases](../../releases) 下载 `CCAVA在线音色.zip`
+1. 到 [Releases](../../releases) 下载 `CCAVA-LocalTTS-v3.1.0.zip`（约 10 MB）
 2. **整个解压**（不要只拖出某个文件）
 3. 双击 `一键安装.bat`
 4. 中途会问要不要开机自启，按 `Y` 或 `N`
@@ -274,6 +274,7 @@ ccava-local-tts/
 │   └── tts-bridge.js      前端适配层
 ├── build/
 │   ├── build.py           一键打包脚本
+│   ├── release.py         创建 Release 并上传附件（token 走环境变量）
 │   ├── TTS-Server.spec    PyInstaller 配置
 │   ├── version_info.txt   exe 版本信息
 │   └── tts.ico            图标
